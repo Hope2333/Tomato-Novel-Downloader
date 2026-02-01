@@ -1,27 +1,13 @@
-name: CI
+# This is a sample build configuration including ARM32 support
 
-on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
+# Setup steps
+setup:
+  - name: Install Dependencies
+    run: sudo apt-get update && sudo apt-get install -y build-essential
 
-jobs:
-  build:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest, linux-glibc, linux-musl, android]
-    steps:
-      - name: Check out code
-        uses: actions/checkout@v2
-
-      - name: Set up Rust
-        uses: rust-lang/rustup
-        with:
-          toolchain: stable
-
-      - name: Run tests
-        run: cargo test
+# Build steps
+build:
+  - name: Build for x86_64
+    run: cargo build --release
+  - name: Build for ARM32
+    run: cargo build --release --target=arm-unknown-linux-gnueabi

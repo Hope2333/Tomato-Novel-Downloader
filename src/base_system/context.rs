@@ -353,7 +353,7 @@ impl ConfigSpec for Config {
             },
             FieldMeta {
                 name: "preferred_book_name_field",
-                description: "优先使用的书名字段 (book_name/original_book_name/book_short_name)",
+                description: "优先使用的书名字段 (book_name/original_book_name/book_short_name/ask_after_download)",
             },
         ];
         &FIELDS
@@ -383,8 +383,15 @@ impl Config {
                 .book_short_name
                 .clone()
                 .or_else(|| book_meta.book_name.clone()),
+            // ask_after_download: 下载期间使用默认书名，生成文件前再询问
+            "ask_after_download" => book_meta.book_name.clone(),
             _ => book_meta.book_name.clone(), // 默认使用 book_name
         }
+    }
+
+    /// 是否设置了“下载完后选择书名”
+    pub fn is_ask_after_download(&self) -> bool {
+        self.preferred_book_name_field == "ask_after_download"
     }
 
     pub fn get_status_folder_path(&self) -> Option<PathBuf> {
@@ -518,7 +525,12 @@ pub fn safe_fs_name(name: &str, replacement: &str, max_len: usize) -> String {
     }
 
     if cleaned.len() > max_len {
-        cleaned.truncate(max_len);
+        // 避免在多字节 UTF-8 字符（如中文）中间截断导致 panic
+        let mut end = max_len;
+        while !cleaned.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        cleaned.truncate(end);
         while cleaned.ends_with(' ') || cleaned.ends_with('.') {
             cleaned.pop();
         }

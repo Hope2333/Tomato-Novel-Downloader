@@ -2,7 +2,7 @@
 
 番茄小说下载器*不精简*版本，由于项目[fanqienovel-downloader](https://github.com/ying-ck/fanqienovel-downloader)一直不更新，于是我根据Dimily的项目Fork并重构
 
-目前完全使用`Rust`重写了整个项目，与原Fork项目几乎没有关系了（~~虽说原本的Python版本也没几行是原项目的了~~），Fork网络也是由于我懒得更换仓库
+目前完全使用`Rust`重写了整个项目，与原Fork项目几乎没有关系了（~~虽说原本的Python版本也没几行是原项目的了~~）
 
 我对其进行重构 + 优化，添加更多功能，包括：EPUB 下载支持、更好的断点续传、更好的错误管理、书本搜索、Web UI 等特性。
 
@@ -37,6 +37,7 @@
     ```
 
     示例：
+
     ```sh
     Tomato-Novel-Downloader.exe --download 7318247498772674083
     ```
@@ -48,11 +49,13 @@
     ```
 
     示例：
+
     ```sh
     Tomato-Novel-Downloader.exe --update 7318247498772674083
     ```
 
 注意：
+
 - 命令行模式为非交互模式，会直接开始下载/更新，无需手动输入
 - 使用配置文件（`config.yml`）中的默认保存路径和下载设置
 - `--download` 和 `--update` 都会智能检测已下载的章节，并提供继续下载或重新下载的选项
@@ -135,7 +138,7 @@ Web UI 提供的功能（纯 HTML，无需额外前端构建）：
 
 已提供 Web UI 版本的 Docker 镜像：
 
-- 镜像地址：https://hub.docker.com/r/zhongbai233/tomato-novel-downloader-webui
+- 镜像地址：[DockerHub](https://hub.docker.com/r/zhongbai233/tomato-novel-downloader-webui)
 - Tags 说明：
   - `latest`：默认 **glibc** 版本（常规服务器/桌面环境）
   - `latest-musl`：**musl** 版本，适用于 **软路由 / NAS** 等轻量系统
@@ -200,30 +203,17 @@ cargo build --release --no-default-features --features no-official-api
   - 搜索功能：不可用（会返回提示/报错）。
   - 段评：不可用（会被强制关闭）。
 
-- 配置要求：必须提供第三方地址池 `api_endpoints`，否则无法下载正文：
-
-```yaml
-# config.yml
-# no-official-api 构建下，正文强制走第三方；该字段会被忽略
-use_official_api: false
-
-# 必填：第三方 API 地址池（至少 1 个）
-api_endpoints:
-    - "https://example.com"  # 你的第三方服务地址
-```
-
 ---
 
 ## Edge TTS 有声小说生成
 
-从当前版本开始，程序内置了 [edge-tts](https://github.com/rany2/edge-tts) 语音合成功能，可在下载文本后自动生成对应的有声小说：
+从当前版本开始，程序内置了 [msedge-tts](https://github.com/hs-cn/msedge-tts) 语音合成功能，可在下载文本后自动生成对应的有声小说：
 
 - 在配置菜单（新 UI 或老 CLI 均可）中启用 `是否生成有声小说`，即可在每次下载完成后生成音频文件。
 - 默认发音人是 `zh-CN-XiaoxiaoNeural`，可以通过配置项自定义语速、音量、音调以及输出格式（`mp3` 或 `wav`）。音调值请使用 `+2Hz`、`-1st` 这类带单位的写法，若留空或填写 0 将忽略音调调整。
 - 可在“有声小说并发数”中调整 Edge TTS 并发任务数量（默认 2），生成时会显示进度条；请根据网络状况和机器性能选择适当的并发度。
 - 音频会存放在输出目录下的 `{书名}_audio` 文件夹中，并按章节顺序命名，例如 `0001-第一章.mp3`。
-- edge-tts 需要联网调用微软的在线服务，请确保运行环境可正常访问外网。
-- 如果你在本地运行源码，需要先安装依赖：`pip install -r requirements.txt`（已包含 edge-tts）。
+- msedge-tts 需要联网调用微软的在线服务，请确保运行环境可正常访问外网。
 
 如遇到生成失败，可在日志中查看详细错误信息。
 
@@ -260,7 +250,7 @@ api_endpoints:
     国内用户可使用：
 
     ```sh
-    bash <(curl -sL https://gh-proxy.org/https://raw.githubusercontent.com/zhongbai2333/Tomato-Novel-Downloader/main/installer.sh)
+    bash <(curl -sL https://dl.zhongbai233.com/installer.sh)
     ```
 
     安装完成后，推荐用 Web UI 启动（示例）：
@@ -287,7 +277,7 @@ api_endpoints:
     国内用户可使用：
 
     ```sh
-    bash <(curl -sL https://gh-proxy.org/https://raw.githubusercontent.com/zhongbai2333/Tomato-Novel-Downloader/main/installer.sh)
+    bash <(curl -sL https://dl.zhongbai233.com/installer.sh)
     ```
 
 4. 小说id是什么？在哪里获取？
@@ -317,7 +307,7 @@ api_endpoints:
 
 ## 免责声明
 
-  本程序仅供 Python 网络爬虫技术、网页数据处理及相关研究的学习用途。请勿将其用于任何违反法律法规或侵犯他人权益的活动。
+  本程序仅供 Rust 网络爬虫技术、网页数据处理及相关研究的学习用途。请勿将其用于任何违反法律法规或侵犯他人权益的活动。
   
   使用本程序的用户需自行承担由此引发的任何法律责任和风险。程序的作者及项目贡献者不对因使用本程序所造成的任何损失、损害或法律后果负责。
   
@@ -327,7 +317,7 @@ api_endpoints:
 
 感谢用户选择此程序，如果喜欢可以加star，如果有什么对本程序的建议，请在“Issues”页面提出。您的喜欢就是我更新的最大动力❤️
 
-感谢原作者Dimily的基础项目
+项目前期 · 感谢原作者Dimily的基础项目
 
 项目前期 · 感谢来自Github用户@helloplhm-qwq的api！
 

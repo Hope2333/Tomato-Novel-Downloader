@@ -3,13 +3,14 @@
 //! 这是对历史 Python `update.py` 的 Rust 侧移植：
 //! - 通过 GitHub Releases API 获取最新版本
 //! - 选择匹配当前平台/架构的资产
-//! - 可选使用 `https://gh-proxy.org/` 前缀加速（可通过 `TND_DISABLE_ACCEL=1` 禁用）
+//! - 可选使用 `https://dl.zhongbai233.com/` 加速（可通过 `TND_DISABLE_ACCEL=1` 禁用）
 //! - 下载后按需校验 SHA256（若 Release 资产提供 digest）
 //! - Windows 使用临时 .bat 进行替换并重启；Unix 直接替换并重启
 
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -33,6 +34,35 @@ pub enum SelfUpdateOutcome {
     UpdateLaunched,
 }
 
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "unknown panic payload".to_string()
+}
+
+fn catch_update_panic<F>(op_name: &str, f: F) -> Result<SelfUpdateOutcome>
+where
+    F: FnOnce() -> Result<SelfUpdateOutcome>,
+{
+    match panic::catch_unwind(AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(payload) => {
+            let detail = panic_payload_to_string(payload);
+            warn!(
+                target: "self_update",
+                "捕获到上游 panic（{op_name}）：{detail}；已阻止进程崩溃"
+            );
+            Err(anyhow!(
+                "self-update panic in {op_name}: {detail}（已拦截，程序继续运行）"
+            ))
+        }
+    }
+}
+
 /// 启动/自动检查场景下的“热更新”检查：
 /// - 仅当最新 release tag 与当前版本相同
 /// - 且 release 资产提供 SHA256
@@ -41,6 +71,12 @@ pub enum SelfUpdateOutcome {
 ///
 /// 例外：当检测到是 `cargo run`（开发态）运行时，不执行强制热更新。
 pub fn check_hotfix_and_apply(current_version: &str) -> Result<SelfUpdateOutcome> {
+    catch_update_panic("check_hotfix_and_apply", || {
+        check_hotfix_and_apply_impl(current_version)
+    })
+}
+
+fn check_hotfix_and_apply_impl(current_version: &str) -> Result<SelfUpdateOutcome> {
     if cfg!(feature = "docker") {
         warn!(
             target: "self_update",
@@ -100,6 +136,12 @@ struct MatchedReleaseAsset {
 }
 
 pub fn check_for_updates(current_version: &str, auto_yes: bool) -> Result<SelfUpdateOutcome> {
+    catch_update_panic("check_for_updates", || {
+        check_for_updates_impl(current_version, auto_yes)
+    })
+}
+
+fn check_for_updates_impl(current_version: &str, auto_yes: bool) -> Result<SelfUpdateOutcome> {
     if cfg!(feature = "docker") {
         warn!(
             target: "self_update",
@@ -125,7 +167,10 @@ pub fn check_for_updates(current_version: &str, auto_yes: bool) -> Result<SelfUp
             let mut input = String::new();
             print!("是否下载并升级到最新版？[Y/n]: ");
             std::io::stdout().flush().ok();
-            std::io::stdin().read_line(&mut input).ok();
+            if std::io::stdin().read_line(&mut input).is_err() {
+                warn!(target: "self_update", "无法读取用户输入，跳过升级");
+                return Ok(SelfUpdateOutcome::Skipped);
+            }
             let ans = input.trim().to_ascii_lowercase();
             if !(ans.is_empty() || ans == "y" || ans == "yes") {
                 warn!(target: "self_update", "用户取消升级");
@@ -283,13 +328,18 @@ fn get_latest_release_asset() -> Result<MatchedReleaseAsset> {
 }
 
 fn get_accelerated_url(original_url: &str) -> String {
-    // 直接使用 gh-proxy 前缀加速：
-    // https://gh-proxy.org/<Github Download URL>
-    // 例如：
-    // https://gh-proxy.org/https://github.com/<owner>/<repo>/releases/download/<tag>/<asset>
-    let url = format!("https://gh-proxy.org/{original_url}");
-    info!(target: "self_update", "使用 gh-proxy 加速下载地址: {url}");
-    url
+    // 使用项目自建 Cloudflare 加速：
+    // https://dl.zhongbai233.com/release/<tag>/<asset>
+    // 原始链接格式：
+    // https://github.com/<owner>/<repo>/releases/download/<tag>/<asset>
+    if let Some(tail) = original_url.split("/releases/download/").nth(1) {
+        let url = format!("https://dl.zhongbai233.com/release/{tail}");
+        info!(target: "self_update", "使用加速下载地址: {url}");
+        url
+    } else {
+        warn!(target: "self_update", "无法解析加速链接，回退到原始地址: {original_url}");
+        original_url.to_string()
+    }
 }
 
 fn start_update(matched: &MatchedReleaseAsset) -> Result<()> {

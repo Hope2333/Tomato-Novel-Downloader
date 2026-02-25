@@ -51,7 +51,11 @@ pub(crate) async fn create_job(
     let book_id_for_resp = book_id.clone();
 
     let jobs = state.jobs.clone();
-    let cfg = state.config.lock().unwrap().clone();
+    let cfg = state
+        .config
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let range_start = req.range_start;
     let range_end = req.range_end;
 
@@ -87,10 +91,28 @@ pub(crate) async fn create_job(
             None
         };
 
-        let result = dl::download_with_plan(
+        let jobs_ask = jobs.clone();
+        let book_name_asker = move |manager: &crate::book_parser::book_manager::BookManager| {
+            let options = dl::collect_book_name_options(manager);
+            if options.len() <= 1 {
+                return None;
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            jobs_ask.set_book_name_options(id, options, tx);
+            rx.recv().ok().flatten()
+        };
+
+        let result = dl::download_with_plan_flow(
             &cfg,
             plan,
-            range,
+            None,
+            dl::DownloadFlowOptions {
+                mode: dl::DownloadMode::Resume,
+                range,
+                retry_failed: dl::RetryFailed::Never,
+                stage_callback: None,
+                book_name_asker: Some(Box::new(book_name_asker)),
+            },
             Some(Box::new(move |snap| jobs_cb.set_progress(id, snap))),
             Some(handle.cancel.clone()),
         );
@@ -113,11 +135,39 @@ pub(crate) async fn create_job(
     ))
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct BookNameChoiceReq {
+    pub(crate) value: Option<String>,
+}
+
+pub(crate) async fn submit_book_name_choice(
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+    Json(req): Json<BookNameChoiceReq>,
+) -> Result<Json<Value>, StatusCode> {
+    if state.jobs.submit_book_name_choice(id, req.value) {
+        Ok(Json(json!({"ok": true})))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
 pub(crate) async fn cancel_job(
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> Result<Json<Value>, StatusCode> {
-    if state.jobs.request_cancel(id) {
+    if state.jobs.request_cancel_and_remove(id) {
+        Ok(Json(json!({"ok": true})))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+pub(crate) async fn delete_job(
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> Result<Json<Value>, StatusCode> {
+    if state.jobs.remove(id) {
         Ok(Json(json!({"ok": true})))
     } else {
         Err(StatusCode::NOT_FOUND)

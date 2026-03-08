@@ -10,12 +10,13 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel as channel;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use tracing::{debug, error, info};
 
 use crate::base_system::book_paths;
 use crate::base_system::context::Config;
 use crate::base_system::cooldown_retry::fetch_with_cooldown_retry;
+use crate::base_system::download_history::{DownloadHistoryRecord, append_download_history};
 use crate::book_parser::book_manager::BookManager;
 use crate::book_parser::finalize_utils;
 use crate::book_parser::parser::ContentParser;
@@ -27,7 +28,7 @@ use super::segment_pool::{
 use super::third_party::{fetch_group_third_party, validate_endpoints};
 
 #[cfg(feature = "official-api")]
-use tomato_novel_official_api::FanqieClient;
+use tomato_novel_official_api::{ContentFetchReport, FanqieClient};
 
 use std::sync::atomic::AtomicBool;
 
@@ -47,6 +48,31 @@ pub struct ChapterDownloader {
     book_id: String,
     client: FanqieClient,
     config: Config,
+}
+
+#[cfg(feature = "official-api")]
+#[derive(Debug, Clone)]
+struct DeferredChapter {
+    chapter: ChapterRef,
+    reason: String,
+}
+
+#[cfg(feature = "official-api")]
+impl DeferredChapter {
+    fn new(chapter: ChapterRef, reason: impl Into<String>) -> Self {
+        Self {
+            chapter,
+            reason: reason.into(),
+        }
+    }
+}
+
+#[cfg(feature = "official-api")]
+#[derive(Debug)]
+struct GroupFetchOutcome {
+    group: Vec<ChapterRef>,
+    value: Value,
+    deferred: Vec<DeferredChapter>,
 }
 
 #[cfg(feature = "official-api")]
@@ -97,71 +123,54 @@ impl ChapterDownloader {
         };
 
         let mut result = DownloadResult::default();
+        let mut deferred_retry: Vec<DeferredChapter> = Vec::new();
+        let epub_mode = self.config.novel_format == "epub";
 
         if worker_count <= 1 {
-            'group_loop: for (group_idx, group) in groups.iter().enumerate() {
+            for (group_idx, group) in groups.iter().enumerate() {
                 if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
                     info!(target: "download", "收到停止信号，结束任务");
                     return Err(anyhow!("用户停止下载"));
                 }
 
-                let ids = group
-                    .iter()
-                    .map(|c| c.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",");
-
-                let epub_mode = self.config.novel_format == "epub";
-                let mut decrypt_failures = 0usize;
-                let value = loop {
-                    match fetch_with_cooldown_retry(
-                        &self.client,
-                        &ids,
-                        epub_mode,
-                        Some(&self.book_id),
-                    ) {
-                        Ok(v) => break v,
-                        Err(err) => {
-                            let msg = err.to_string();
-                            if msg.contains("Decryption failed") {
-                                decrypt_failures += 1;
-                                error!(
-                                    target: "download",
-                                    attempt = decrypt_failures,
-                                    "批量获取章节解密失败，将强制刷新 IID/密钥并重试"
-                                );
-                                if let Err(e) = self.client.force_refresh_session() {
-                                    error!(target: "download", error = %e, "强制刷新会话失败");
-                                }
-                                if decrypt_failures >= 3 {
-                                    return Err(anyhow!(
-                                        "内容解密失败连续 {} 次，停止下载",
-                                        decrypt_failures
-                                    ));
-                                }
-                                continue;
-                            }
-
-                            error!("批量获取章节失败: {}", msg);
-                            for ch in *group {
-                                manager.save_error_chapter(&ch.id, &ch.title);
-                                result.failed += 1;
-                                if let Some(bar) = save_bar.as_ref() {
-                                    bar.inc(1);
-                                }
-                                progress.inc_saved();
-                            }
-                            if let Some(bar) = download_bar.as_ref() {
-                                bar.inc(1);
-                            }
-                            progress.inc_group();
-                            continue 'group_loop;
+                let outcome = match fetch_group_best_effort(
+                    &self.client,
+                    group,
+                    epub_mode,
+                    Some(&self.book_id),
+                ) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let reason = err.to_string();
+                        info!(
+                            target: "download",
+                            reason = %reason,
+                            count = group.len(),
+                            "首轮批量拉取失败，整组章节加入延后重试队列"
+                        );
+                        GroupFetchOutcome {
+                            group: group.to_vec(),
+                            value: json!({"code": 0, "data": {}}),
+                            deferred: group
+                                .iter()
+                                .cloned()
+                                .map(|ch| DeferredChapter::new(ch, reason.clone()))
+                                .collect(),
                         }
                     }
                 };
 
-                let parsed = ContentParser::extract_api_content(&value, &self.config);
-                for ch in *group {
+                let parsed = ContentParser::extract_api_content(&outcome.value, &self.config);
+                for ch in &outcome.group {
+                    if let Some(deferred) = outcome
+                        .deferred
+                        .iter()
+                        .find(|item| item.chapter.id == ch.id)
+                    {
+                        deferred_retry.push(deferred.clone());
+                        continue;
+                    }
+
                     match parsed.get(&ch.id) {
                         Some((content, title)) if !content.is_empty() => {
                             let cleaned = if self.config.novel_format.eq_ignore_ascii_case("epub") {
@@ -175,37 +184,37 @@ impl ChapterDownloader {
                             if let Some(pool) = seg_pool.as_mut() {
                                 pool.submit(&ch.id);
                             }
+                            if let Some(bar) = save_bar.as_ref() {
+                                bar.inc(1);
+                            }
+                            progress.inc_saved();
+                            saved_in_job += 1;
+                            let remaining = total_chapters.saturating_sub(saved_in_job);
+
+                            if saved_in_job.is_multiple_of(10) || remaining == 0 {
+                                info!(
+                                    target: "download",
+                                    done = saved_in_job,
+                                    remaining,
+                                    "保存完成 {} 章 剩 {} 章",
+                                    saved_in_job,
+                                    remaining
+                                );
+                            } else {
+                                debug!(
+                                    target: "download",
+                                    done = saved_in_job,
+                                    remaining,
+                                    "保存完成 {} 章 剩 {} 章",
+                                    saved_in_job,
+                                    remaining
+                                );
+                            }
                         }
                         _ => {
-                            manager.save_error_chapter(&ch.id, &ch.title);
-                            result.failed += 1;
+                            deferred_retry
+                                .push(DeferredChapter::new(ch.clone(), "章节内容缺失或为空"));
                         }
-                    }
-                    if let Some(bar) = save_bar.as_ref() {
-                        bar.inc(1);
-                    }
-                    progress.inc_saved();
-                    saved_in_job += 1;
-                    let remaining = total_chapters.saturating_sub(saved_in_job);
-
-                    if saved_in_job.is_multiple_of(10) || remaining == 0 {
-                        info!(
-                            target: "download",
-                            done = saved_in_job,
-                            remaining,
-                            "保存完成 {} 章 剩 {} 章",
-                            saved_in_job,
-                            remaining
-                        );
-                    } else {
-                        debug!(
-                            target: "download",
-                            done = saved_in_job,
-                            remaining,
-                            "保存完成 {} 章 剩 {} 章",
-                            saved_in_job,
-                            remaining
-                        );
                     }
                 }
 
@@ -226,7 +235,7 @@ impl ChapterDownloader {
         } else {
             // 多线程模式
             let (tx_jobs, rx_jobs) = channel::unbounded::<Vec<ChapterRef>>();
-            let (tx_res, rx_res) = channel::unbounded::<Result<(Vec<ChapterRef>, Value)>>();
+            let (tx_res, rx_res) = channel::unbounded::<Result<GroupFetchOutcome>>();
 
             for group in groups.iter() {
                 let _ = tx_jobs.send(group.to_vec());
@@ -256,41 +265,26 @@ impl ChapterDownloader {
                             let _ = tx.send(Err(anyhow!("用户停止下载")));
                             return;
                         }
-                        let ids = group
-                            .iter()
-                            .map(|c| c.id.as_str())
-                            .collect::<Vec<_>>()
-                            .join(",");
-
                         let epub_mode = cfg.novel_format == "epub";
-                        let mut decrypt_failures = 0usize;
-                        let value = loop {
-                            match fetch_with_cooldown_retry(
-                                &client,
-                                &ids,
-                                epub_mode,
-                                Some(&book_id_clone),
-                            ) {
-                                Ok(v) => break Ok(v),
-                                Err(err) => {
-                                    let msg = err.to_string();
-                                    if msg.contains("Decryption failed") {
-                                        decrypt_failures += 1;
-                                        let _ = client.force_refresh_session();
-                                        if decrypt_failures >= 3 {
-                                            break Err(anyhow!(
-                                                "内容解密失败连续 {} 次，停止下载",
-                                                decrypt_failures
-                                            ));
-                                        }
-                                        continue;
-                                    }
-                                    break Err(anyhow!(msg));
-                                }
-                            }
-                        };
+                        let value = fetch_group_best_effort(
+                            &client,
+                            &group,
+                            epub_mode,
+                            Some(&book_id_clone),
+                        )
+                        .or_else(|err| {
+                            let reason = err.to_string();
+                            Ok(GroupFetchOutcome {
+                                group: group.clone(),
+                                value: json!({"code": 0, "data": {}}),
+                                deferred: group
+                                    .into_iter()
+                                    .map(|ch| DeferredChapter::new(ch, reason.clone()))
+                                    .collect(),
+                            })
+                        });
 
-                        let _ = tx.send(value.map(|v| (group, v)));
+                        let _ = tx.send(value);
                     }
                 });
             }
@@ -302,10 +296,19 @@ impl ChapterDownloader {
                     return Err(anyhow!("用户停止下载"));
                 }
 
-                let (group, value) = res?;
+                let outcome = res?;
 
-                let parsed = ContentParser::extract_api_content(&value, &self.config);
-                for ch in &group {
+                let parsed = ContentParser::extract_api_content(&outcome.value, &self.config);
+                for ch in &outcome.group {
+                    if let Some(deferred) = outcome
+                        .deferred
+                        .iter()
+                        .find(|item| item.chapter.id == ch.id)
+                    {
+                        deferred_retry.push(deferred.clone());
+                        continue;
+                    }
+
                     match parsed.get(&ch.id) {
                         Some((content, title)) if !content.is_empty() => {
                             let cleaned = if self.config.novel_format.eq_ignore_ascii_case("epub") {
@@ -319,14 +322,14 @@ impl ChapterDownloader {
                             if let Some(pool) = seg_pool.as_mut() {
                                 pool.submit(&ch.id);
                             }
+                            progress.inc_saved();
+                            saved_in_job += 1;
                         }
                         _ => {
-                            manager.save_error_chapter(&ch.id, &ch.title);
-                            result.failed += 1;
+                            deferred_retry
+                                .push(DeferredChapter::new(ch.clone(), "章节内容缺失或为空"));
                         }
                     }
-                    progress.inc_saved();
-                    saved_in_job += 1;
                 }
 
                 if let Some(pool) = seg_pool.as_ref() {
@@ -350,6 +353,94 @@ impl ChapterDownloader {
 
                 manager.save_download_status();
             }
+        }
+
+        if !deferred_retry.is_empty() {
+            info!(
+                target: "download",
+                count = deferred_retry.len(),
+                "首轮下载完成，统一刷新 IID 后重试失败章节"
+            );
+
+            if let Err(e) = self.client.force_refresh_session() {
+                error!(target: "download", error = %e, "统一重试前刷新 IID 失败，将继续使用当前会话重试");
+            }
+
+            for deferred in deferred_retry {
+                if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
+                    return Err(anyhow!("用户停止下载"));
+                }
+
+                let chapter = deferred.chapter.clone();
+                let outcome = match fetch_group_best_effort(
+                    &self.client,
+                    std::slice::from_ref(&chapter),
+                    epub_mode,
+                    Some(&self.book_id),
+                ) {
+                    Ok(v) => v,
+                    Err(err) => GroupFetchOutcome {
+                        group: vec![chapter.clone()],
+                        value: json!({"code": 0, "data": {}}),
+                        deferred: vec![DeferredChapter::new(chapter.clone(), err.to_string())],
+                    },
+                };
+
+                let parsed = ContentParser::extract_api_content(&outcome.value, &self.config);
+                if let Some((content, title)) = parsed.get(&chapter.id)
+                    && !content.is_empty()
+                    && outcome.deferred.is_empty()
+                {
+                    let cleaned = if self.config.novel_format.eq_ignore_ascii_case("epub") {
+                        extract_body_fragment(content)
+                    } else {
+                        content.clone()
+                    };
+                    manager.save_chapter(&chapter.id, title, &cleaned);
+                    manager.append_downloaded_chapter(&chapter.id, title, &cleaned);
+                    result.success += 1;
+                    if let Some(pool) = seg_pool.as_mut() {
+                        pool.submit(&chapter.id);
+                    }
+                } else {
+                    let final_reason = outcome
+                        .deferred
+                        .first()
+                        .map(|item| item.reason.as_str())
+                        .unwrap_or(deferred.reason.as_str());
+                    log_failed_chapter(&chapter, final_reason);
+                    manager.save_error_chapter(&chapter.id, &chapter.title);
+                    result.failed += 1;
+                }
+
+                if let Some(bar) = save_bar.as_ref() {
+                    bar.inc(1);
+                }
+                progress.inc_saved();
+                saved_in_job += 1;
+                let remaining = total_chapters.saturating_sub(saved_in_job);
+                if saved_in_job.is_multiple_of(10) || remaining == 0 {
+                    info!(
+                        target: "download",
+                        done = saved_in_job,
+                        remaining,
+                        "保存完成 {} 章 剩 {} 章",
+                        saved_in_job,
+                        remaining
+                    );
+                } else {
+                    debug!(
+                        target: "download",
+                        done = saved_in_job,
+                        remaining,
+                        "保存完成 {} 章 剩 {} 章",
+                        saved_in_job,
+                        remaining
+                    );
+                }
+            }
+
+            manager.save_download_status();
         }
 
         let _ = download_bar.take();
@@ -436,7 +527,7 @@ pub fn download_with_plan_flow(
 
     loop {
         let book_name = manager.book_name.clone();
-        let result = download_chapters_into_manager(
+        let result = match download_chapters_into_manager(
             config,
             &plan.book_id,
             &book_name,
@@ -446,7 +537,23 @@ pub fn download_with_plan_flow(
             Some(&plan._raw),
             &mut reporter,
             cancel_flag.as_ref(),
-        )?;
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                let success = count_success_for_chosen(&manager, &chosen_chapters);
+                let failed = chosen_chapters.len().saturating_sub(success);
+                append_download_history(&DownloadHistoryRecord::new(
+                    manager.book_id.clone(),
+                    manager.book_name.clone(),
+                    manager.author.clone(),
+                    chosen_chapters.len(),
+                    success,
+                    failed,
+                    "failed".to_string(),
+                ));
+                return Err(e);
+            }
+        };
 
         if let Some(cb) = stage_callback.as_mut() {
             cb(result);
@@ -469,61 +576,71 @@ pub fn download_with_plan_flow(
         reporter.reset_for_retry(chosen_chapters.len(), pending.len());
     }
 
-    finalize_from_manager(
+    let finalize_result = finalize_from_manager(
         &mut manager,
         &chosen_chapters,
         Some(&plan._raw),
         Some(&mut reporter),
         cancel_flag.as_ref(),
         &mut book_name_asker,
-    )
+    );
+
+    let success = count_success_for_chosen(&manager, &chosen_chapters);
+    let failed = chosen_chapters.len().saturating_sub(success);
+    let status = if finalize_result.is_ok() && failed == 0 {
+        "success"
+    } else {
+        "failed"
+    };
+    append_download_history(&DownloadHistoryRecord::new(
+        manager.book_id.clone(),
+        manager.book_name.clone(),
+        manager.author.clone(),
+        chosen_chapters.len(),
+        success,
+        failed,
+        status.to_string(),
+    ));
+
+    finalize_result
 }
 
 // ── Manager 初始化与辅助 ──────────────────────────────────────
 
-fn rename_old_folder_if_needed(
-    config: &Config,
-    book_id: &str,
-    new_book_name: &str,
-    meta: &BookMeta,
-) -> Result<()> {
-    let possible_old_names = vec![
-        meta.book_name.as_deref(),
-        meta.original_book_name.as_deref(),
-        meta.book_short_name.as_deref(),
-    ];
-
+fn rename_old_folder_if_needed(config: &Config, book_id: &str, new_book_name: &str) -> Result<()> {
     let new_folder = book_paths::book_folder_path(config, book_id, Some(new_book_name));
 
     if new_folder.exists() {
         return Ok(());
     }
 
-    for old_name_str in possible_old_names.into_iter().flatten() {
-        if old_name_str == new_book_name {
-            continue;
-        }
+    let Some(old_folder) = config.find_existing_status_folder_by_book_id(book_id, None)? else {
+        return Ok(());
+    };
 
-        let old_folder = book_paths::book_folder_path(config, book_id, Some(old_name_str));
+    if old_folder != new_folder {
+        let old_name = old_folder
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|name| name.split_once('_').map(|(_, title)| title.to_string()))
+            .unwrap_or_default();
 
-        if old_folder.exists() && old_folder != new_folder {
-            info!(
+        info!(
+            target: "download",
+            old = %old_folder.display(),
+            new = %new_folder.display(),
+            "检测到书名变更，按 BookID 命中旧目录并重命名"
+        );
+
+        if let Err(e) = std::fs::rename(&old_folder, &new_folder) {
+            debug!(
                 target: "download",
-                old = %old_folder.display(),
-                new = %new_folder.display(),
-                "检测到书名偏好变更，重命名文件夹"
+                error = ?e,
+                "重命名文件夹失败，将继续复用旧目录"
             );
-
-            if let Err(e) = std::fs::rename(&old_folder, &new_folder) {
-                debug!(
-                    target: "download",
-                    error = ?e,
-                    "重命名文件夹失败，将使用新文件夹"
-                );
-            } else {
-                rename_cover_files_if_needed(&new_folder, old_name_str, new_book_name);
-                return Ok(());
-            }
+        } else {
+            rename_cover_files_if_needed(&new_folder, &old_name, new_book_name);
+            return Ok(());
         }
     }
 
@@ -573,7 +690,7 @@ pub(crate) fn init_manager_from_plan(config: &Config, plan: &DownloadPlan) -> Re
         .clone()
         .unwrap_or_else(|| plan.book_id.clone());
 
-    if let Err(e) = rename_old_folder_if_needed(config, &plan.book_id, &book_name, meta) {
+    if let Err(e) = rename_old_folder_if_needed(config, &plan.book_id, &book_name) {
         debug!(
             target: "download",
             error = ?e,
@@ -613,6 +730,13 @@ pub(crate) fn pending_failed(manager: &BookManager, chapters: &[ChapterRef]) -> 
         .filter(|ch| matches!(manager.downloaded.get(&ch.id), Some((_, None))))
         .cloned()
         .collect()
+}
+
+fn count_success_for_chosen(manager: &BookManager, chapters: &[ChapterRef]) -> usize {
+    chapters
+        .iter()
+        .filter(|ch| matches!(manager.downloaded.get(&ch.id), Some((_, Some(_)))))
+        .count()
 }
 
 // ── 核心下载编排 ──────────────────────────────────────────────
@@ -819,6 +943,7 @@ fn download_third_party_flow(
                     }
                 }
                 _ => {
+                    log_failed_chapter(ch, "章节内容缺失或为空");
                     manager.save_error_chapter(&ch.id, &ch.title);
                     result.failed += 1;
                 }
@@ -967,4 +1092,267 @@ fn extract_body_fragment(input: &str) -> String {
         }
     }
     input.to_string()
+}
+
+fn log_failed_chapter(chapter: &ChapterRef, reason: &str) {
+    error!(
+        target: "download",
+        chapter_id = %chapter.id,
+        chapter_title = %chapter.title,
+        reason,
+        "章节下载失败：{} ({})",
+        chapter.title,
+        chapter.id
+    );
+}
+
+#[cfg(feature = "official-api")]
+fn fetch_group_best_effort(
+    client: &FanqieClient,
+    group: &[ChapterRef],
+    epub_mode: bool,
+    book_id: Option<&str>,
+) -> Result<GroupFetchOutcome> {
+    let ids = group
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let report = fetch_best_effort_with_cooldown_retry(client, &ids, epub_mode, book_id)?;
+
+    if should_escalate_full_group_retry(group.len(), &report) {
+        let reason = report
+            .error
+            .as_deref()
+            .unwrap_or("整组章节均缺失，疑似 IID/会话异常");
+        info!(
+            target: "download",
+            total = group.len(),
+            reason,
+            "检测到整组章节全部失败，立即切回整组换 IID 重试策略"
+        );
+
+        let value = fetch_with_cooldown_retry(client, &ids, epub_mode, book_id)?;
+        return Ok(GroupFetchOutcome {
+            group: group.to_vec(),
+            value,
+            deferred: Vec::new(),
+        });
+    }
+
+    let deferred = map_report_to_deferred(group, &report);
+    if let Some(reason) = report.error.as_deref()
+        && !deferred.is_empty()
+    {
+        info!(
+            target: "download",
+            deferred = deferred.len(),
+            total = group.len(),
+            reason,
+            "首轮下载发现缺失章节，加入延后重试队列"
+        );
+    }
+
+    Ok(GroupFetchOutcome {
+        group: group.to_vec(),
+        value: report.value,
+        deferred,
+    })
+}
+
+#[cfg(feature = "official-api")]
+fn fetch_best_effort_with_cooldown_retry(
+    client: &FanqieClient,
+    ids: &str,
+    epub_mode: bool,
+    book_id: Option<&str>,
+) -> Result<ContentFetchReport> {
+    let mut delay = std::time::Duration::from_millis(1100);
+    for attempt in 0..6 {
+        match client.get_contents_best_effort(ids, epub_mode, book_id) {
+            Ok(v) => return Ok(v),
+            Err(err) => {
+                let msg = err.to_string();
+                if msg.contains("Cooldown") || msg.contains("CooldownNotReached") {
+                    std::thread::sleep(delay);
+                    delay = std::cmp::min(delay * 2, std::time::Duration::from_secs(8));
+                    continue;
+                }
+                if attempt == 0
+                    && (msg.contains("tomato_novel_network_core") || msg.contains("Library"))
+                {
+                    return Err(anyhow!(
+                        "{}\n\n提示：请先构建 Tomato-Novel-Network-Core，并将动态库放到当前目录或设置 FANQIE_NETWORK_CORE_DLL 指向其绝对路径。",
+                        msg
+                    ));
+                }
+                return Err(anyhow!(msg));
+            }
+        }
+    }
+
+    Err(anyhow!("Cooldown exceeded retries"))
+}
+
+#[cfg(feature = "official-api")]
+fn map_report_to_deferred(
+    group: &[ChapterRef],
+    report: &ContentFetchReport,
+) -> Vec<DeferredChapter> {
+    let reason = report.error.as_deref().unwrap_or("章节内容缺失或为空");
+
+    group
+        .iter()
+        .filter(|ch| report.missing_ids.iter().any(|id| id == &ch.id))
+        .cloned()
+        .map(|ch| DeferredChapter::new(ch, reason))
+        .collect()
+}
+
+#[cfg(feature = "official-api")]
+fn should_escalate_full_group_retry(group_len: usize, report: &ContentFetchReport) -> bool {
+    group_len > 1 && report.missing_ids.len() == group_len
+}
+
+#[allow(dead_code)]
+fn merge_content_values(values: Vec<Value>) -> Value {
+    let mut merged = json!({
+        "code": 0,
+        "data": {}
+    });
+
+    for value in values {
+        let Some(data_map) = value.get("data").and_then(|v| v.as_object()) else {
+            continue;
+        };
+
+        if let Some(merged_map) = merged.get_mut("data").and_then(|v| v.as_object_mut()) {
+            for (cid, info) in data_map {
+                merged_map.insert(cid.clone(), info.clone());
+            }
+        }
+    }
+
+    merged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_content_values_combines_data_entries() {
+        let merged = merge_content_values(vec![
+            json!({
+                "code": 0,
+                "data": {
+                    "1": { "content": "A", "title": "甲" }
+                }
+            }),
+            json!({
+                "code": 0,
+                "data": {
+                    "2": { "content": "B", "title": "乙" }
+                }
+            }),
+        ]);
+
+        let data = merged.get("data").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(data.len(), 2);
+        assert_eq!(
+            data.get("1")
+                .and_then(|v| v.get("content"))
+                .and_then(|v| v.as_str()),
+            Some("A")
+        );
+        assert_eq!(
+            data.get("2")
+                .and_then(|v| v.get("content"))
+                .and_then(|v| v.as_str()),
+            Some("B")
+        );
+    }
+
+    #[test]
+    fn merge_content_values_ignores_entries_without_data_map() {
+        let merged = merge_content_values(vec![
+            json!({"code": 0, "data": {"1": {"content": "A"}}}),
+            json!({"code": 0, "message": "bad"}),
+        ]);
+
+        let data = merged.get("data").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(data.len(), 1);
+        assert!(data.contains_key("1"));
+    }
+
+    #[test]
+    fn format_failed_log_uses_title_and_id() {
+        let ch = ChapterRef {
+            id: "123".to_string(),
+            title: "测试章节".to_string(),
+        };
+
+        let msg = format!("章节下载失败：{} ({})", ch.title, ch.id);
+        assert_eq!(msg, "章节下载失败：测试章节 (123)");
+    }
+
+    #[test]
+    fn map_report_to_deferred_marks_only_missing_ids() {
+        let group = vec![
+            ChapterRef {
+                id: "1".to_string(),
+                title: "甲".to_string(),
+            },
+            ChapterRef {
+                id: "2".to_string(),
+                title: "乙".to_string(),
+            },
+        ];
+        let report = ContentFetchReport {
+            value: json!({"data": {"1": {"content": "ok"}}}),
+            missing_ids: vec!["2".to_string()],
+            error: Some("缺 1 章".to_string()),
+        };
+
+        let deferred = map_report_to_deferred(&group, &report);
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].chapter.id, "2");
+        assert_eq!(deferred[0].reason, "缺 1 章");
+    }
+
+    #[test]
+    fn should_escalate_full_group_retry_only_for_complete_group_failure() {
+        let all_missing = ContentFetchReport {
+            value: json!({"data": {}}),
+            missing_ids: vec!["1".to_string(), "2".to_string()],
+            error: Some("register_key empty".to_string()),
+        };
+        let partial_missing = ContentFetchReport {
+            value: json!({"data": {"1": {"content": "ok"}}}),
+            missing_ids: vec!["2".to_string()],
+            error: Some("缺 1 章".to_string()),
+        };
+
+        assert!(should_escalate_full_group_retry(2, &all_missing));
+        assert!(!should_escalate_full_group_retry(2, &partial_missing));
+        assert!(!should_escalate_full_group_retry(1, &all_missing));
+    }
+
+    #[test]
+    fn rename_old_folder_by_book_id_even_if_api_book_name_changed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut config = crate::base_system::context::Config::default();
+        config.save_path = temp_dir.path().display().to_string();
+
+        let old_folder = temp_dir.path().join("123_旧书名");
+        std::fs::create_dir_all(&old_folder).unwrap();
+        std::fs::write(old_folder.join("status.json"), "{}\n").unwrap();
+
+        rename_old_folder_if_needed(&config, "123", "新书名").unwrap();
+
+        let new_folder = temp_dir.path().join("123_新书名");
+        assert!(new_folder.exists());
+        assert!(!old_folder.exists());
+    }
 }
